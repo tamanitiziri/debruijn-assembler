@@ -7,6 +7,8 @@ import subprocess
 import os
 import matplotlib.pyplot as plt
 import networkx as nx
+from collections import defaultdict, deque
+import pygraphviz as pgv
 
 def open_fastq(path):
     """Ouvre un fichier FASTQ, qu'il soit gzippé ou non."""
@@ -24,6 +26,217 @@ def generate_kmers(sequence: str, k: int):
 #def process_record(record):
 #    """Génère les k-mers pour un record FASTQ donné."""
 #    return generate_kmers(str(record.seq), 3)
+
+
+class EulerianPathFinder:
+    def __init__(self, edges_file: str):
+            """
+            Initialise avec le fichier d'arcs étiquetés.
+            """
+            from collections import defaultdict, deque
+
+            self.graph = defaultdict(list)  # sommet -> liste des arcs (suffix, kmer)
+            self.arc_count = 0
+            
+            # Pour suivre les degrés
+            self.in_degree = defaultdict(int)
+            self.out_degree = defaultdict(int)
+
+            # Charger le graphe
+            self.load_graph(edges_file)
+            
+    def load_graph(self, edges_file: str):
+        """Charge le graphe depuis le fichier d'arcs."""
+        print("[INFO] Chargement du graphe...")
+        with open(edges_file) as f:
+            for line in f:
+                prefix, suffix, kmer = line.strip().split("\t")
+                self.graph[prefix].append((suffix, kmer))
+                self.out_degree[prefix] += 1
+                self.in_degree[suffix] += 1
+                self.arc_count += 1
+        print(f"[OK] Graphe chargé: {self.arc_count} arcs, {len(self.graph)} sommets")
+    
+    def find_start_node(self):
+        """
+        Trouve le nœud de départ pour le cycle eulérien.
+        S'il y a un sommet avec out_degree > in_degree, c'est le début.
+        Sinon, on prend un sommet arbitraire avec des arcs sortants.
+        """
+        start_node = None
+        
+        # Chercher un sommet avec plus d'arcs sortants qu'entrants
+        all_nodes = set(self.out_degree.keys()) | set(self.in_degree.keys())
+        
+        for node in all_nodes:
+            if self.out_degree[node] > self.in_degree[node]:
+                return node
+        
+        # Si aucun trouvé, prendre un sommet avec des arcs sortants
+        for node in self.graph:
+            if self.graph[node]:  # a des arcs sortants
+                return node
+        
+        # Fallback: premier sommet du graphe
+        return next(iter(self.graph)) if self.graph else None
+    
+    def hierholzer_algorithm(self):
+        """
+        Implémentation de l'algorithme de Hierholzer pour trouver un cycle eulérien.
+        Complexité: O(n) où n est le nombre d'arcs.
+        
+        Returns:
+            Liste des k-mers dans l'ordre du cycle eulérien
+        """
+        if self.arc_count == 0:
+            return []
+        
+        # Faire une copie du graphe pour pouvoir le modifier
+        graph_copy = defaultdict(deque)
+        for node in self.graph:
+            graph_copy[node] = deque(self.graph[node])
+        
+        # Étape 1: Choisir un sommet de départ
+        start_node = self.find_start_node()
+        if start_node is None:
+            raise ValueError("Aucun sommet de départ trouvé")
+        
+        print(f"[INFO] Début du cycle eulérien au sommet: {start_node}")
+        
+        # Stack pour le cycle principal
+        stack = [start_node]
+        cycle = []  # Stockera les k-mers dans l'ordre
+        
+        # Étape 2: Construire le cycle
+        while stack:
+            current_node = stack[-1]
+            
+            # Si le nœud courant a encore des arcs sortants
+            if graph_copy[current_node]:
+                # Prendre le premier arc disponible
+                next_node, kmer_label = graph_copy[current_node].popleft()
+                
+                # Ajouter le nœud suivant à la pile
+                stack.append(next_node)
+                
+                # Stocker le k-mer (optionnel, selon ce qu'on veut en sortie)
+                # cycle.append(kmer_label)
+                
+            else:
+                # Plus d'arcs sortants, ajouter au cycle et backtrack
+                if len(stack) > 1:
+                    # L'arc qu'on vient de parcourir en backtrack
+                    from_node = stack[-2]
+                    to_node = stack[-1]
+                    
+                    # Trouver le k-mer correspondant (pourrait être optimisé)
+                    for i, (n, kmer) in enumerate(self.graph[from_node]):
+                        if n == to_node:
+                            cycle.append(kmer)
+                            break
+                
+                stack.pop()
+        
+        # Inverser le cycle car on a construit à l'envers lors du backtrack
+        cycle.reverse()
+        
+        # Vérifier qu'on a utilisé tous les arcs
+        if len(cycle) != self.arc_count:
+            print(f"[ATTENTION] Cycle incomplet: {len(cycle)}/{self.arc_count} arcs utilisés")
+        else:
+            print(f"[SUCCÈS] Cycle eulérien trouvé: {len(cycle)} arcs")
+        
+        return cycle
+    
+    def find_eulerian_path(self):
+        """
+        Trouve un chemin eulérien (si le graphe n'a pas de cycle eulérien).
+        Ajoute un arc fictif si nécessaire.
+        """
+        # Identifier les nœuds avec déséquilibre
+        start_candidates = []
+        end_candidates = []
+        
+        all_nodes = set(self.out_degree.keys()) | set(self.in_degree.keys())
+        
+        for node in all_nodes:
+            diff = self.out_degree[node] - self.in_degree[node]
+            if diff == 1:
+                start_candidates.append(node)
+            elif diff == -1:
+                end_candidates.append(node)
+            elif diff != 0:
+                print(f"[ATTENTION] Sommet {node} a un déséquilibre important: {diff}")
+        
+        # Si parfaitement équilibré, utiliser Hierholzer normal
+        if not start_candidates and not end_candidates:
+            print("[INFO] Graphe équilibré - recherche de cycle eulérien")
+            return self.hierholzer_algorithm()
+        
+        # Sinon, ajouter un arc fictif pour créer un cycle
+        if len(start_candidates) == 1 and len(end_candidates) == 1:
+            start_node = start_candidates[0]
+            end_node = end_candidates[0]
+            fictive_kmer = f"FICTIVE_{start_node}_{end_node}"
+            
+            print(f"[INFO] Ajout d'un arc fictif: {end_node} -> {start_node}")
+            
+            # Ajouter l'arc fictif
+            self.graph[end_node].append((start_node, fictive_kmer))
+            self.out_degree[end_node] += 1
+            self.in_degree[start_node] += 1
+            self.arc_count += 1
+            
+            # Trouver le cycle eulérien
+            cycle = self.hierholzer_algorithm()
+            
+            # Retirer l'arc fictif et réorganiser le cycle
+            return self._remove_fictive_edge(cycle, fictive_kmer, start_node, end_node)
+        else:
+            raise ValueError("Graphe ne peut pas avoir de chemin eulérien")
+    
+    def _remove_fictive_edge(self, cycle, fictive_kmer, start_node, end_node):
+        """
+        Retire l'arc fictif et réorganise le cycle en chemin.
+        """
+        if fictive_kmer not in cycle:
+            print("[ATTENTION] Arc fictif non trouvé dans le cycle")
+            return cycle
+        
+        # Trouver la position de l'arc fictif
+        fictive_index = cycle.index(fictive_kmer)
+        
+        # Réorganiser le cycle pour commencer au vrai début
+        if fictive_index + 1 < len(cycle):
+            new_cycle = cycle[fictive_index + 1:] + cycle[:fictive_index]
+        else:
+            new_cycle = cycle[:fictive_index]
+        
+        print(f"[INFO] Chemin eulérien réorganisé: début={start_node}, fin={end_node}")
+        return new_cycle
+    
+    def reconstruct_sequence(self, kmer_path: list, k: int):
+        """
+        Reconstruit la séquence ADN à partir du chemin de k-mers.
+        
+        Args:
+            kmer_path: Liste des k-mers dans l'ordre du chemin
+            k: Taille des k-mers
+            
+        Returns:
+            Séquence ADN reconstruite
+        """
+        if not kmer_path:
+            return ""
+        
+        # Commencer avec le premier k-mer
+        sequence = kmer_path[0]
+        
+        # Pour chaque k-mer suivant, ajouter seulement la dernière base
+        for next_kmer in kmer_path[1:]:
+            sequence += next_kmer[-1]
+        
+        return sequence
 
 
 ###############################################
@@ -97,60 +310,6 @@ def build_debruijn_edges_to_file_with_labels(kmer_file: str, output_edges_file: 
 
 
 
-def sort_debruijn_edges(edge_file: str, output_sorted_file: str):
-    """
-    Trie les arcs du graphe de De Bruijn par préfixe.
-    Permet de regrouper les suffixes ensemble sans tout mettre en RAM.
-    
-    Args:
-        edge_file: Fichier "prefix suffix" non trié
-        output_sorted_file: Fichier trié par clé (prefix)
-    """
-    print("[INFO] Tri des arcs du graphe...")
-
-    cmd = f"sort {edge_file} > {output_sorted_file}"
-    subprocess.run(cmd, shell=True, check=True)
-
-    print(f"[OK] Graphe trié généré → {output_sorted_file}")
-
-###############################################
-# VISUALISATION DU GRAPHE DE DE BRUIJN
-###############################################
-
-
-def visualize_graph(edge_file: str, max_edges=300):
-    print("[INFO] Construction du graphe pour visualisation...")
-
-    G = nx.MultiDiGraph()
-
-    with open(edge_file) as f:
-        for i, line in enumerate(f):
-            if i > max_edges:
-                break
-
-            prefix, suffix, kmer = line.strip().split("\t")
-            G.add_edge(prefix, suffix, label=kmer)
-
-    pos = nx.spring_layout(G, seed=42)
-
-    plt.figure(figsize=(12, 10))
-
-    nx.draw(G, pos, with_labels=True,
-            node_size=500, font_size=8,
-            arrowsize=10, node_color="#66c2a5")
-
-    # 🔥 Labels corrects pour MultiDiGraph
-    edge_labels = {(u, v, k): d["label"]
-                   for u, v, k, d in G.edges(keys=True, data=True)}
-
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=6)
-
-    plt.title("Graphe de De Bruijn (k-mers = étiquettes d'arêtes)")
-    plt.tight_layout()
-    plt.show()
-
-
-
 
 #######################################
 path = "exemple.fastq"
@@ -172,10 +331,29 @@ build_debruijn_edges_to_file_with_labels("kmers_raw.txt", "edges_labeled.txt")
 
 #visualize_graph("edges_labeled.txt")
 
+###############################################################
+# Étape E — Calcul du chemin/cycle eulérien
 
-#################################################################
+
+euler_finder = EulerianPathFinder("edges_labeled.txt")
+
+# Chercher un cycle eulérien si possible
+kmer_path = euler_finder.find_eulerian_path()
+
+# Reconstruire la séquence complète à partir du chemin
+sequence_reconstructed = euler_finder.reconstruct_sequence(kmer_path, k)
+
+print("Séquence reconstruite")
+#garder la sequen construite dans un fichier assemblied_sequence.txt
+#print(sequence_reconstructed)
+with open("assembled_sequence.txt", "w") as f:
+    f.write(sequence_reconstructed + "\n")
+
+
+
+#################################################################visualisation du graphe de De Bruijn avec pygraphviz
 # Charger les arcs depuis ton fichier
-import pygraphviz as pgv
+
 edges_file = "edges_labeled.txt"
 G = pgv.AGraph(directed=True, strict=False)  # strict=False pour autoriser multi-arêtes
 
@@ -189,7 +367,7 @@ with open(edges_file) as f:
 G.layout(prog='dot')  # 'dot' pour DAG, 'neato' ou 'fdp' pour plus libre
 
 # Sauvegarder en PNG ou PDF
-G.draw("debruijn_graph.png")
+#G.draw("debruijn_graph.png")
 G.draw("debruijn_graph.pdf")
 
 print("Graphe généré : debruijn_graph.png")
