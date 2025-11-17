@@ -1,0 +1,10 @@
+
+*
+
+!*.py
+
+!.gitignore
+
+# (Optionnel) Ne pas ignorer les fichiers de configuration (si tu en veux)
+#!CMakeLists.txt
+#!Makefile
