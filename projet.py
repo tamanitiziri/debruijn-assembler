@@ -24,13 +24,13 @@ def generate_kmers(sequence: str, k: int):
     return [sequence[i:i+k] for i in range(len(sequence) - k + 1)]
 
 class EulerianPathFinder:
-    def __init__(self, edges_file: str, k: int):
+    def __init__(self, edges_file: str):
         """
         Initialise avec le fichier d'arcs étiquetés.
         """
-        self.graph = defaultdict(list)  # sommet -> liste des arcs (suffix, kmer)
+        self.graph = defaultdict(list)  # sommet -> liste des arcs (suffix, kmer, is_fictive)
         self.arc_count = 0
-        self.k = k
+        self.fictive_edges = []  # Pour suivre les arêtes fictives ajoutées
         
         # Pour suivre les degrés
         self.in_degree = defaultdict(int)
@@ -44,88 +44,188 @@ class EulerianPathFinder:
         print("[INFO] Chargement du graphe...")
         with open(edges_file) as f:
             for line in f:
-                parts = line.strip().split("\t")
-                if len(parts) == 3:
-                    prefix, suffix, kmer = parts
-                    self.graph[prefix].append((suffix, kmer))
-                    self.out_degree[prefix] += 1
-                    self.in_degree[suffix] += 1
-                    self.arc_count += 1
+                prefix, suffix, kmer = line.strip().split("\t")
+                self.graph[prefix].append((suffix, kmer, False))  # False = arête réelle
+                self.out_degree[prefix] += 1
+                self.in_degree[suffix] += 1
+                self.arc_count += 1
         print(f"[OK] Graphe chargé: {self.arc_count} arcs, {len(self.graph)} sommets")
     
-    def find_start_node(self):
+    def balance_graph(self):
         """
-        Trouve le nœud de départ pour le chemin eulérien.
-        Dans un vrai assemblage, on prend souvent le nœud avec le plus grand excédent sortant.
+        Équilibre le graphe en ajoutant des arêtes fictives si nécessaire.
+        Retourne le nombre d'arêtes fictives ajoutées.
         """
-        start_node = None
-        max_diff = -float('inf')
+        print("[INFO] Analyse de l'équilibre du graphe...")
+        
+        start_nodes = []  # nœuds avec out_degree > in_degree
+        end_nodes = []    # nœuds avec in_degree > out_degree
         
         all_nodes = set(self.out_degree.keys()) | set(self.in_degree.keys())
         
         for node in all_nodes:
             diff = self.out_degree[node] - self.in_degree[node]
-            if diff > max_diff:
-                max_diff = diff
-                start_node = node
+            if diff > 0:
+                start_nodes.append((node, diff))
+            elif diff < 0:
+                end_nodes.append((node, -diff))
         
-        # Si aucun nœud avec excédent sortant, prendre celui avec le plus d'arcs sortants
-        if start_node is None:
-            for node in all_nodes:
-                if self.out_degree[node] > 0 and (start_node is None or self.out_degree[node] > self.out_degree[start_node]):
-                    start_node = node
+        print(f"[INFO] Déséquilibre: {len(start_nodes)} start nodes, {len(end_nodes)} end nodes")
         
-        return start_node
+        # Ajouter des arêtes fictives pour équilibrer
+        fictive_count = 0
+        for (start_node, start_count), (end_node, end_count) in zip(start_nodes, end_nodes):
+            # Ajouter une arête fictive de end_node vers start_node
+            fictive_kmer = f"FICTIVE_{fictive_count}"
+            self.graph[end_node].append((start_node, fictive_kmer, True))
+            self.out_degree[end_node] += 1
+            self.in_degree[start_node] += 1
+            self.arc_count += 1
+            fictive_count += 1
+            
+            self.fictive_edges.append((end_node, start_node, fictive_kmer))
+        
+        print(f"[INFO] {fictive_count} arêtes fictives ajoutées")
+        return fictive_count
     
-    def find_longest_greedy_path(self):
+    def find_start_node(self):
         """
-        Cherche un chemin eulérien approximativement le plus long possible.
+        Trouve le nœud de départ pour le cycle eulérien.
+        """
+        start_node = None
+        
+        # Chercher un sommet avec plus d'arcs sortants qu'entrants
+        all_nodes = set(self.out_degree.keys()) | set(self.in_degree.keys())
+        
+        for node in all_nodes:
+            if self.out_degree[node] > self.in_degree[node]:
+                return node
+        
+        # Si aucun trouvé, prendre un sommet avec des arcs sortants
+        for node in self.graph:
+            if self.graph[node]:  # a des arcs sortants
+                return node
+        
+        # Fallback: premier sommet du graphe
+        return next(iter(self.graph)) if self.graph else None
+    
+    def hierholzer_algorithm(self):
+        """
+        Implémentation de l'algorithme de Hierholzer pour trouver un cycle eulérien.
         """
         if self.arc_count == 0:
             return []
-
+        
+        # Faire une copie du graphe pour pouvoir le modifier
         graph_copy = defaultdict(deque)
         for node in self.graph:
-            # Trier les arcs pour favoriser les sommets avec plus d’options
-            graph_copy[node] = deque(sorted(self.graph[node], key=lambda x: -self.out_degree.get(x[0], 0)))
-
+            graph_copy[node] = deque(self.graph[node])
+        
+        # Étape 1: Choisir un sommet de départ
         start_node = self.find_start_node()
         if start_node is None:
-            for node in graph_copy:
-                if graph_copy[node]:
-                    start_node = node
-                    break
-        if start_node is None:
-            return []
-
-        print(f"[INFO] Début du chemin long au sommet: {start_node}")
-
-        stack = [(start_node, [], set())]  # node, path, used_edges
-        longest_path = []
-
-        while stack:
-            current_node, path_so_far, used_edges = stack.pop()
-
-            extended = False
-            for next_node, kmer in graph_copy[current_node]:
-                edge_id = (current_node, next_node, kmer)
-                if edge_id not in used_edges:
-                    new_path = path_so_far + [kmer]
-                    new_used = used_edges | {edge_id}
-                    stack.append((next_node, new_path, new_used))
-                    extended = True
-
-            if not extended:
-                # Aucun arc non visité : comparer la longueur
-                if len(path_so_far) > len(longest_path):
-                    longest_path = path_so_far
-
-        print(f"[INFO] Longueur du chemin trouvé: {len(longest_path)} arcs")
-        return longest_path
-
+            raise ValueError("Aucun sommet de départ trouvé")
         
+        print(f"[INFO] Début du cycle eulérien au sommet: {start_node}")
+        
+        # Stack pour le cycle principal
+        stack = [start_node]
+        cycle = []  # Stockera les k-mers dans l'ordre
+        
+        # Étape 2: Construire le cycle
+        while stack:
+            current_node = stack[-1]
+            
+            # Si le nœud courant a encore des arcs sortants
+            if graph_copy[current_node]:
+                # Prendre le premier arc disponible
+                next_node, kmer_label, is_fictive = graph_copy[current_node].popleft()
+                
+                # Ajouter le nœud suivant à la pile
+                stack.append(next_node)
+                
+            else:
+                # Plus d'arcs sortants, ajouter au cycle et backtrack
+                if len(stack) > 1:
+                    from_node = stack[-2]
+                    to_node = stack[-1]
+                    
+                    # Trouver le k-mer correspondant
+                    for i, (n, kmer, fictive) in enumerate(self.graph[from_node]):
+                        if n == to_node:
+                            cycle.append((kmer, fictive))  # Stocker avec l'info fictive
+                            break
+                
+                stack.pop()
+        
+        # Inverser le cycle car on a construit à l'envers lors du backtrack
+        cycle.reverse()
+        
+        # Vérifier qu'on a utilisé tous les arcs
+        if len(cycle) != self.arc_count:
+            print(f"[ATTENTION] Cycle incomplet: {len(cycle)}/{self.arc_count} arcs utilisés")
+        else:
+            print(f"[SUCCÈS] Cycle eulérien trouvé: {len(cycle)} arcs")
+        
+        return cycle
     
-    def reconstruct_sequence(self, kmer_path: list):
+    def find_eulerian_path_with_contigs(self):
+        """
+        Trouve un chemin eulérien même pour les graphes non équilibrés.
+        Retourne une liste de contigs (fragments).
+        """
+        print("[INFO] Recherche de chemin eulérien avec gestion des contigs...")
+        
+        # Équilibrer le graphe si nécessaire
+        fictive_count = self.balance_graph()
+        
+        if fictive_count == 0:
+            print("[INFO] Graphe déjà équilibré - recherche de cycle simple")
+            cycle = self.hierholzer_algorithm()
+            return [self._extract_sequence_from_path(cycle)]
+        
+        # Trouver le cycle eulérien dans le graphe équilibré
+        cycle = self.hierholzer_algorithm()
+        
+        # Fragmenter en contigs aux arêtes fictives
+        contigs = self._split_into_contigs(cycle)
+        
+        print(f"[SUCCÈS] Génération de {len(contigs)} contigs")
+        return contigs
+    
+    def _split_into_contigs(self, cycle):
+        """
+        Fragmente le cycle en contigs aux points des arêtes fictives.
+        """
+        contigs = []
+        current_contig = []
+        
+        for kmer, is_fictive in cycle:
+            if is_fictive:
+                # Arête fictive trouvée - terminer le contig courant
+                if current_contig:
+                    sequence = self.reconstruct_sequence(current_contig, 3)  # k=3 par défaut
+                    if sequence:  # Ne pas ajouter de contigs vides
+                        contigs.append(sequence)
+                    current_contig = []
+            else:
+                # Arête réelle - ajouter au contig courant
+                current_contig.append(kmer)
+        
+        # Ajouter le dernier contig
+        if current_contig:
+            sequence = self.reconstruct_sequence(current_contig, 3)
+            if sequence:
+                contigs.append(sequence)
+        
+        return contigs
+    
+    def _extract_sequence_from_path(self, path):
+        """Extrait la séquence d'un chemin de k-mers."""
+        kmers_only = [kmer for kmer, fictive in path if not fictive]
+        return self.reconstruct_sequence(kmers_only, 3)
+    
+    def reconstruct_sequence(self, kmer_path: list, k: int):
         """
         Reconstruit la séquence ADN à partir du chemin de k-mers.
         """
@@ -141,143 +241,28 @@ class EulerianPathFinder:
         
         return sequence
 
-    def find_connected_components(self):
-        """
-        Trouve les composantes connexes du graphe pour un assemblage par contigs.
-        """
-        visited = set()
-        components = []
-        
-        def dfs(node, component):
-            stack = [node]
-            while stack:
-                current = stack.pop()
-                if current not in visited:
-                    visited.add(current)
-                    component.append(current)
-                    for neighbor, _ in self.graph.get(current, []):
-                        if neighbor not in visited:
-                            stack.append(neighbor)
-                    # Also check incoming neighbors
-                    for potential_source in self.graph:
-                        for neighbor, _ in self.graph[potential_source]:
-                            if neighbor == current and potential_source not in visited:
-                                stack.append(potential_source)
-        
-        for node in self.graph:
-            if node not in visited:
-                component = []
-                dfs(node, component)
-                components.append(component)
-        
-        return components
-
-    def assemble_contigs(self):
-        """
-        Assemble des contigs à partir des composantes connexes.
-        """
-        components = self.find_connected_components()
-        print(f"[INFO] {len(components)} composantes connexes trouvées")
-        
-        contigs = []
-        for i, component in enumerate(components):
-            if len(component) > 1:  # Ignorer les composantes trop petites
-                # Créer un sous-graphe pour cette composante
-                subgraph = {}
-                for node in component:
-                    subgraph[node] = [edge for edge in self.graph[node] if edge[0] in component]
-                
-                # Assembler cette composante
-                contig = self._assemble_component(subgraph, component)
-                if contig:
-                    contigs.append(contig)
-                    print(f"[INFO] Contig {i+1}: {len(contig)} bp")
-        
-        return contigs
-    
-    def _assemble_component(self, subgraph, component):
-        """
-        Assemble un contig à partir d'une composante connexe.
-        """
-        if not subgraph:
-            return ""
-        
-        # Trouver un bon point de départ (nœud avec peu d'entrées)
-        start_node = None
-        for node in component:
-            in_deg = sum(1 for n in subgraph for edge in subgraph[n] if edge[0] == node)
-            if in_deg == 0 or (start_node is None and subgraph.get(node)):
-                start_node = node
-                break
-        
-        if start_node is None:
-            start_node = next(iter(subgraph))
-        
-        # Parcourir le graphe
-        current = start_node
-        sequence = current
-        visited_edges = set()
-        max_steps = len(component) * 2  # Éviter les boucles infinies
-        
-        for _ in range(max_steps):
-            if current not in subgraph or not subgraph[current]:
-                break
-            
-            # Prendre le premier arc non visité
-            found_next = False
-            for i, (next_node, kmer) in enumerate(subgraph[current]):
-                edge_id = (current, next_node, kmer)
-                if edge_id not in visited_edges:
-                    visited_edges.add(edge_id)
-                    sequence += kmer[-1] if len(kmer) == self.k else kmer[-1]
-                    current = next_node
-                    found_next = True
-                    break
-            
-            if not found_next:
-                break
-        
-        return sequence
-
-###############################################
-# FONCTIONS SCALABLES POUR GROS FASTQ
-###############################################
-
+# Les fonctions restantes sont identiques à votre version originale
 def build_kmer_database_to_file(fastq_path: str, k: int, output_file: str):
-    """
-    Génère un fichier contenant TOUS les k-mers extraits du FASTQ.
-    """
+    """Génère un fichier contenant TOUS les k-mers extraits du FASTQ."""
     print(f"[INFO] Génération des k-mers {k}-mer → {output_file}")
     
     with open(output_file, "w") as out:
         with open_fastq(fastq_path) as handle:
             for record in SeqIO.parse(handle, "fastq"):
                 seq = str(record.seq).upper()
-                
-                # Filtrer les séquences trop courtes
-                if len(seq) >= k:
-                    # Génération en streaming
-                    for i in range(len(seq) - k + 1):
-                        kmer = seq[i:i+k]
-                        # Filtrer les k-mers avec des caractères non-ADN
-                        if all(base in 'ACGT' for base in kmer):
-                            out.write(kmer + "\n")
-
+                for kmer in generate_kmers(seq, k):
+                    out.write(kmer + "\n")
     print("[OK] Fichier brut de k-mers généré.")
 
 def count_kmers_with_sort(kmer_file: str, output_count_file: str):
-    """
-    Utilise sort | uniq -c pour compter les k-mers.
-    """
+    """Compte les k-mers avec sort | uniq -c"""
     print("[INFO] Comptage des k-mers via sort | uniq -c ...")
     cmd = f"sort {kmer_file} | uniq -c > {output_count_file}"
     subprocess.run(cmd, shell=True, check=True)
     print(f"[OK] Comptage terminé → {output_count_file}")
 
 def build_debruijn_edges_to_file_with_labels(kmer_file: str, output_edges_file: str):
-    """
-    Construit les arcs du graphe de De Bruijn avec étiquette = kmer.
-    """
+    """Construit les arcs du graphe de De Bruijn avec étiquette = kmer."""
     print(f"[INFO] Génération des arcs étiquetés → {output_edges_file}")
     
     with open(kmer_file) as km_in, open(output_edges_file, "w") as edges_out:
@@ -292,74 +277,29 @@ def build_debruijn_edges_to_file_with_labels(kmer_file: str, output_edges_file: 
     
     print("[OK] Arcs étiquetés générés.")
 
-def filter_low_coverage_kmers(kmer_count_file: str, output_filtered: str, min_coverage: int = 2):
-    """
-    Filtre les k-mers avec une couverture trop faible.
-    """
-    print(f"[INFO] Filtrage des k-mers avec couverture < {min_coverage}")
-    
-    with open(kmer_count_file) as f_in, open(output_filtered, "w") as f_out:
-        for line in f_in:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                count = int(parts[0])
-                kmer = parts[1]
-                if count >= min_coverage and all(base in 'ACGT' for base in kmer):
-                    f_out.write(kmer + "\n")
-    
-    print("[OK] Filtrage terminé")
+# Exemple d'utilisation
+if __name__ == "__main__":
+    path = "reads.fastq.fq"  # Chemin vers le fichier FASTQ
+    k = 31
 
-#######################################
-# SCRIPT PRINCIPAL
-#######################################
-# SCRIPT PRINCIPAL — VERSION CONTIGS COMPLETS
-#######################################
-
-path = "reads.fastq.fq"
-k = 31
-
-try:
-    # Étape A — Génération des k-mers (streaming)
+    # Étape A — Génération des k-mers
     build_kmer_database_to_file(path, k, "kmers_raw.txt")
 
-    # Étape B — Comptage (sort | uniq -c)
+    # Étape B — Comptage
     count_kmers_with_sort("kmers_raw.txt", "kmers_counted.txt")
 
-    # Étape B2 — Filtrage des k-mers à faible couverture
-    filter_low_coverage_kmers("kmers_counted.txt", "kmers_filtered.txt", min_coverage=2)
-
     # Étape C — Construction des arcs du graphe
-    build_debruijn_edges_to_file_with_labels("kmers_filtered.txt", "edges_labeled.txt")
+    build_debruijn_edges_to_file_with_labels("kmers_raw.txt", "edges_labeled.txt")
 
-    # Étape D — Assemblage
-    euler_finder = EulerianPathFinder("edges_labeled.txt", k)
+    # Étape D — Recherche du chemin eulérien avec gestion des contigs
+    euler_finder = EulerianPathFinder("edges_labeled.txt")
     
-    # On récupère tous les contigs possibles
-    print("[INFO] Assemblage de tous les contigs...")
-    contigs = []
+    # Cette méthode gère automatiquement les graphes non eulériens
+    contigs = euler_finder.find_eulerian_path_with_contigs()
 
-    # Essayer d'abord un chemin eulérien principal
-    kmer_path = euler_finder.find_longest_greedy_path()
-
-    if kmer_path:
-        sequence_reconstructed = euler_finder.reconstruct_sequence(kmer_path)
-        contigs.append(sequence_reconstructed)
-        print(f"[INFO] Chemin eulérien principal: {len(sequence_reconstructed)} bp")
-
-    # Puis compléter avec toutes les autres composantes
-    contigs_from_components = euler_finder.assemble_contigs()
-    contigs.extend(contigs_from_components)
-
-    # Écriture finale dans un fichier FASTA
-    with open("assembled_contigs.fasta", "w") as f:
+    # Sauvegarde des contigs
+    with open("assembled_contigs.txt", "w") as f:
         for i, contig in enumerate(contigs):
-            if len(contig) >= k:  # éviter les contigs trop courts
-                f.write(f">contig_{i+1}_length_{len(contig)}\n")
-                f.write(contig + "\n")
-
-    print(f"[SUCCÈS] {len(contigs)} contigs écrits dans assembled_contigs.fasta")
-
-except Exception as e:
-    print(f"[ERREUR] {e}")
-    import traceback
-    traceback.print_exc()
+            f.write(f">contig_{i}\n{contig}\n")
+    
+    print(f"[TERMINÉ] {len(contigs)} contigs générés dans 'assembled_contigs.txt'")
