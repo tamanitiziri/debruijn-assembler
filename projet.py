@@ -243,8 +243,8 @@ class EulerianPathFinder:
 
 # Les fonctions restantes sont identiques à votre version originale
 def build_kmer_database_to_file(fastq_path: str, k: int, output_file: str):
-    """Génère un fichier contenant TOUS les k-mers extraits du FASTQ."""
-    print(f"[INFO] Génération des k-mers {k}-mer → {output_file}")
+    """Génère un fichier contenant TOUS les k-mers extraits du FASTQ en streaming."""
+    print(f"[INFO] Génération des k-mers {k}-mer → {output_file} (streaming)")
     
     with open(output_file, "w") as out:
         with open_fastq(fastq_path) as handle:
@@ -252,14 +252,9 @@ def build_kmer_database_to_file(fastq_path: str, k: int, output_file: str):
                 seq = str(record.seq).upper()
                 for kmer in generate_kmers(seq, k):
                     out.write(kmer + "\n")
-    print("[OK] Fichier brut de k-mers généré.")
+    print("[OK] Fichier brut de k-mers généré (streaming).")
+    
 
-def count_kmers_with_sort(kmer_file: str, output_count_file: str):
-    """Compte les k-mers avec sort | uniq -c"""
-    print("[INFO] Comptage des k-mers via sort | uniq -c ...")
-    cmd = f"sort {kmer_file} | uniq -c > {output_count_file}"
-    subprocess.run(cmd, shell=True, check=True)
-    print(f"[OK] Comptage terminé → {output_count_file}")
 
 def build_debruijn_edges_to_file_with_labels(kmer_file: str, output_edges_file: str):
     """Construit les arcs du graphe de De Bruijn avec étiquette = kmer."""
@@ -285,9 +280,7 @@ if __name__ == "__main__":
     # Étape A — Génération des k-mers
     build_kmer_database_to_file(path, k, "kmers_raw.txt")
 
-    # Étape B — Comptage
-    count_kmers_with_sort("kmers_raw.txt", "kmers_counted.txt")
-
+   
     # Étape C — Construction des arcs du graphe
     build_debruijn_edges_to_file_with_labels("kmers_raw.txt", "edges_labeled.txt")
 
@@ -298,8 +291,8 @@ if __name__ == "__main__":
     contigs = euler_finder.find_eulerian_path_with_contigs()
 
     # Sauvegarde des contigs
-    with open("assembled_contigs.txt", "w") as f:
+    with open("assembled_contigs.fasta", "w") as f:
         for i, contig in enumerate(contigs):
             f.write(f">contig_{i}\n{contig}\n")
     
-    print(f"[TERMINÉ] {len(contigs)} contigs générés dans 'assembled_contigs.txt'")
+    print(f"[TERMINÉ] {len(contigs)} contigs générés dans 'assembled_contigs.fasta'")
