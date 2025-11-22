@@ -2,364 +2,369 @@
 
 from Bio import SeqIO
 import gzip
-from concurrent.futures import ProcessPoolExecutor
 import subprocess
 import os
-import matplotlib.pyplot as plt
-import networkx as nx
+import sys
+import argparse
 from collections import defaultdict, deque
-import pygraphviz as pgv
 
 def open_fastq(path):
-    """Ouvre un fichier FASTQ, qu'il soit gzippé ou non."""
-    with open(path, 'rb') as test_f:
-        magic_number = test_f.read(2)
-    if magic_number == b'\x1f\x8b':
-        return gzip.open(path, 'rt')
-    else:
-        return open(path, 'r')
+    """Ouvre un fichier FASTQ (généralement non compressé dans ce contexte)."""
+    return open(path, 'r')
 
 def generate_kmers(sequence: str, k: int):
     """Génère tous les k-mers de taille k à partir d'une séquence donnée."""
+    if len(sequence) < k:
+        return []
     return [sequence[i:i+k] for i in range(len(sequence) - k + 1)]
 
 class EulerianPathFinder:
     def __init__(self, edges_file: str, k: int):
         """
         Initialise avec le fichier d'arcs étiquetés.
+        k: Taille du k-mer utilisé dans le graphe.
         """
-        self.graph = defaultdict(list)  # sommet -> liste des arcs (suffix, kmer)
-        self.arc_count = 0
         self.k = k
+        self.graph = defaultdict(list)  # sommet -> liste des arcs (suffix, kmer, is_fictive)
+        self.arc_count = 0
+        self.fictive_edges = []
         
-        # Pour suivre les degrés
         self.in_degree = defaultdict(int)
         self.out_degree = defaultdict(int)
 
-        # Charger le graphe
         self.load_graph(edges_file)
         
     def load_graph(self, edges_file: str):
         """Charge le graphe depuis le fichier d'arcs."""
         print("[INFO] Chargement du graphe...")
-        with open(edges_file) as f:
-            for line in f:
-                parts = line.strip().split("\t")
-                if len(parts) == 3:
-                    prefix, suffix, kmer = parts
-                    self.graph[prefix].append((suffix, kmer))
+        try:
+            with open(edges_file) as f:
+                for line in f:
+                    prefix, suffix, kmer = line.strip().split("\t")
+                    self.graph[prefix].append((suffix, kmer, False))
                     self.out_degree[prefix] += 1
                     self.in_degree[suffix] += 1
                     self.arc_count += 1
+        except FileNotFoundError:
+            print(f"[ERREUR] Fichier d'arcs non trouvé: {edges_file}")
+            exit(1)
         print(f"[OK] Graphe chargé: {self.arc_count} arcs, {len(self.graph)} sommets")
-    
-    def find_start_node(self):
+        
+    def balance_graph(self):
         """
-        Trouve le nœud de départ pour le chemin eulérien.
-        Dans un vrai assemblage, on prend souvent le nœud avec le plus grand excédent sortant.
+        Équilibre le graphe en ajoutant des arêtes fictives si nécessaire.
         """
-        start_node = None
-        max_diff = -float('inf')
+        print("[INFO] Analyse de l'équilibre du graphe...")
+        
+        start_nodes = []
+        end_nodes = []
         
         all_nodes = set(self.out_degree.keys()) | set(self.in_degree.keys())
         
         for node in all_nodes:
             diff = self.out_degree[node] - self.in_degree[node]
-            if diff > max_diff:
-                max_diff = diff
-                start_node = node
+            if diff > 0:
+                start_nodes.append((node, diff))
+            elif diff < 0:
+                end_nodes.append((node, -diff))
         
-        # Si aucun nœud avec excédent sortant, prendre celui avec le plus d'arcs sortants
-        if start_node is None:
-            for node in all_nodes:
-                if self.out_degree[node] > 0 and (start_node is None or self.out_degree[node] > self.out_degree[start_node]):
-                    start_node = node
+        fictive_count = 0
+        # Connexion simplifiée des nœuds déséquilibrés
+        for i in range(min(len(start_nodes), len(end_nodes))):
+            start_node, _ = start_nodes[i]
+            end_node, _ = end_nodes[i]
+            
+            # Arête fictive de end_node vers start_node
+            fictive_kmer = f"FICTIVE_{fictive_count}"
+            self.graph[end_node].append((start_node, fictive_kmer, True))
+            self.out_degree[end_node] += 1
+            self.in_degree[start_node] += 1
+            self.arc_count += 1
+            fictive_count += 1
+            
+            self.fictive_edges.append((end_node, start_node, fictive_kmer))
         
-        return start_node
-    
-    def find_longest_greedy_path(self):
-        """
-        Cherche un chemin eulérien approximativement le plus long possible.
-        """
+        print(f"[INFO] {fictive_count} arêtes fictives ajoutées")
+        return fictive_count
+        
+    def find_start_node(self):
+        """Trouve le noeud de départ pour le cycle eulérien."""
+        
+        all_nodes = set(self.out_degree.keys()) | set(self.in_degree.keys())
+        # Noeud naturel (out > in)
+        for node in all_nodes:
+            if self.out_degree[node] > self.in_degree[node]:
+                return node
+        
+        # Graphe équilibré, prendre le premier nœud avec des arcs sortants
+        for node in self.graph:
+            if self.graph[node]:
+                return node
+        
+        return next(iter(self.graph)) if self.graph else None
+        
+    def hierholzer_algorithm(self):
+        """Implémentation de l'algorithme de Hierholzer."""
         if self.arc_count == 0:
             return []
-
+        
         graph_copy = defaultdict(deque)
         for node in self.graph:
-            # Trier les arcs pour favoriser les sommets avec plus d’options
-            graph_copy[node] = deque(sorted(self.graph[node], key=lambda x: -self.out_degree.get(x[0], 0)))
-
+            graph_copy[node] = deque(self.graph[node])
+        
         start_node = self.find_start_node()
         if start_node is None:
-            for node in graph_copy:
-                if graph_copy[node]:
-                    start_node = node
-                    break
-        if start_node is None:
+            print("[ATTENTION] Aucun sommet de départ trouvé.")
             return []
-
-        print(f"[INFO] Début du chemin long au sommet: {start_node}")
-
-        stack = [(start_node, [], set())]  # node, path, used_edges
-        longest_path = []
-
-        while stack:
-            current_node, path_so_far, used_edges = stack.pop()
-
-            extended = False
-            for next_node, kmer in graph_copy[current_node]:
-                edge_id = (current_node, next_node, kmer)
-                if edge_id not in used_edges:
-                    new_path = path_so_far + [kmer]
-                    new_used = used_edges | {edge_id}
-                    stack.append((next_node, new_path, new_used))
-                    extended = True
-
-            if not extended:
-                # Aucun arc non visité : comparer la longueur
-                if len(path_so_far) > len(longest_path):
-                    longest_path = path_so_far
-
-        print(f"[INFO] Longueur du chemin trouvé: {len(longest_path)} arcs")
-        return longest_path
-
         
-    
-    def reconstruct_sequence(self, kmer_path: list):
-        """
-        Reconstruit la séquence ADN à partir du chemin de k-mers.
-        """
+        print(f"[INFO] Début du cycle eulérien au sommet: {start_node}")
+        
+        stack = [start_node]
+        cycle = []
+        
+        while stack:
+            current_node = stack[-1]
+            
+            if graph_copy[current_node]:
+                next_node, kmer_label, is_fictive = graph_copy[current_node].popleft()
+                
+                stack.append(next_node)
+                cycle.append((kmer_label, is_fictive))
+            else:
+                stack.pop()
+
+        if len(cycle) != self.arc_count:
+            print(f"[ATTENTION] Cycle incomplet: {len(cycle)}/{self.arc_count} arcs utilisés.")
+        else:
+            print(f"[SUCCÈS] Cycle eulérien trouvé: {len(cycle)} arcs")
+        
+        return cycle
+        
+    def find_eulerian_path_with_contigs(self):
+        """Trouve le chemin eulérien et le fragmente en contigs."""
+        print("[INFO] Recherche de chemin eulérien avec gestion des contigs...")
+        
+        self.balance_graph()
+        cycle = self.hierholzer_algorithm()
+        contigs = self._split_into_contigs(cycle)
+        
+        print(f"[SUCCÈS] Génération de {len(contigs)} contigs")
+        return contigs
+        
+    def _split_into_contigs(self, cycle):
+        """Fragmente le cycle en contigs aux arêtes fictives."""
+        contigs = []
+        current_contig = []
+        
+        for kmer, is_fictive in cycle:
+            if is_fictive:
+                if current_contig:
+                    sequence = self.reconstruct_sequence(current_contig, self.k)
+                    if sequence:
+                        contigs.append(sequence)
+                    current_contig = []
+            else:
+                current_contig.append(kmer)
+        
+        # Ajouter le dernier contig
+        if current_contig:
+            sequence = self.reconstruct_sequence(current_contig, self.k)
+            if sequence:
+                contigs.append(sequence)
+        
+        return contigs
+        
+    def reconstruct_sequence(self, kmer_path: list, k: int):
+        """Reconstruit la séquence ADN à partir du chemin de k-mers."""
         if not kmer_path:
             return ""
         
-        # Commencer avec le premier k-mer
         sequence = kmer_path[0]
         
-        # Pour chaque k-mer suivant, ajouter seulement la dernière base
         for next_kmer in kmer_path[1:]:
             sequence += next_kmer[-1]
         
         return sequence
 
-    def find_connected_components(self):
-        """
-        Trouve les composantes connexes du graphe pour un assemblage par contigs.
-        """
-        visited = set()
-        components = []
-        
-        def dfs(node, component):
-            stack = [node]
-            while stack:
-                current = stack.pop()
-                if current not in visited:
-                    visited.add(current)
-                    component.append(current)
-                    for neighbor, _ in self.graph.get(current, []):
-                        if neighbor not in visited:
-                            stack.append(neighbor)
-                    # Also check incoming neighbors
-                    for potential_source in self.graph:
-                        for neighbor, _ in self.graph[potential_source]:
-                            if neighbor == current and potential_source not in visited:
-                                stack.append(potential_source)
-        
-        for node in self.graph:
-            if node not in visited:
-                component = []
-                dfs(node, component)
-                components.append(component)
-        
-        return components
-
-    def assemble_contigs(self):
-        """
-        Assemble des contigs à partir des composantes connexes.
-        """
-        components = self.find_connected_components()
-        print(f"[INFO] {len(components)} composantes connexes trouvées")
-        
-        contigs = []
-        for i, component in enumerate(components):
-            if len(component) > 1:  # Ignorer les composantes trop petites
-                # Créer un sous-graphe pour cette composante
-                subgraph = {}
-                for node in component:
-                    subgraph[node] = [edge for edge in self.graph[node] if edge[0] in component]
-                
-                # Assembler cette composante
-                contig = self._assemble_component(subgraph, component)
-                if contig:
-                    contigs.append(contig)
-                    print(f"[INFO] Contig {i+1}: {len(contig)} bp")
-        
-        return contigs
-    
-    def _assemble_component(self, subgraph, component):
-        """
-        Assemble un contig à partir d'une composante connexe.
-        """
-        if not subgraph:
-            return ""
-        
-        # Trouver un bon point de départ (nœud avec peu d'entrées)
-        start_node = None
-        for node in component:
-            in_deg = sum(1 for n in subgraph for edge in subgraph[n] if edge[0] == node)
-            if in_deg == 0 or (start_node is None and subgraph.get(node)):
-                start_node = node
-                break
-        
-        if start_node is None:
-            start_node = next(iter(subgraph))
-        
-        # Parcourir le graphe
-        current = start_node
-        sequence = current
-        visited_edges = set()
-        max_steps = len(component) * 2  # Éviter les boucles infinies
-        
-        for _ in range(max_steps):
-            if current not in subgraph or not subgraph[current]:
-                break
-            
-            # Prendre le premier arc non visité
-            found_next = False
-            for i, (next_node, kmer) in enumerate(subgraph[current]):
-                edge_id = (current, next_node, kmer)
-                if edge_id not in visited_edges:
-                    visited_edges.add(edge_id)
-                    sequence += kmer[-1] if len(kmer) == self.k else kmer[-1]
-                    current = next_node
-                    found_next = True
-                    break
-            
-            if not found_next:
-                break
-        
-        return sequence
-
-###############################################
-# FONCTIONS SCALABLES POUR GROS FASTQ
-###############################################
-
 def build_kmer_database_to_file(fastq_path: str, k: int, output_file: str):
-    """
-    Génère un fichier contenant TOUS les k-mers extraits du FASTQ.
-    """
-    print(f"[INFO] Génération des k-mers {k}-mer → {output_file}")
+    """Génère un fichier contenant TOUS les k-mers extraits du FASTQ."""
     
-    with open(output_file, "w") as out:
-        with open_fastq(fastq_path) as handle:
-            for record in SeqIO.parse(handle, "fastq"):
-                seq = str(record.seq).upper()
-                
-                # Filtrer les séquences trop courtes
-                if len(seq) >= k:
-                    # Génération en streaming
-                    for i in range(len(seq) - k + 1):
-                        kmer = seq[i:i+k]
-                        # Filtrer les k-mers avec des caractères non-ADN
-                        if all(base in 'ACGT' for base in kmer):
-                            out.write(kmer + "\n")
+    if not os.path.exists(fastq_path):
+        raise FileNotFoundError(f"Fichier FASTQ non trouvé à: {fastq_path}")
 
-    print("[OK] Fichier brut de k-mers généré.")
+    try:
+        with open(output_file, "w") as out:
+            with open_fastq(fastq_path) as handle:
+                for record in SeqIO.parse(handle, "fastq"):
+                    seq = str(record.seq).upper()
+                    for kmer in generate_kmers(seq, k):
+                        out.write(kmer + "\n")
+        print("[OK] Fichier brut de k-mers généré.")
+    except Exception as e:
+        print(f"[ERREUR] Échec de la génération des k-mers: {e}")
+        exit(1)
 
-def count_kmers_with_sort(kmer_file: str, output_count_file: str):
-    """
-    Utilise sort | uniq -c pour compter les k-mers.
-    """
-    print("[INFO] Comptage des k-mers via sort | uniq -c ...")
-    cmd = f"sort {kmer_file} | uniq -c > {output_count_file}"
-    subprocess.run(cmd, shell=True, check=True)
-    print(f"[OK] Comptage terminé → {output_count_file}")
 
 def build_debruijn_edges_to_file_with_labels(kmer_file: str, output_edges_file: str):
-    """
-    Construit les arcs du graphe de De Bruijn avec étiquette = kmer.
-    """
+    """Construit les arcs du graphe de De Bruijn avec étiquette = kmer."""
     print(f"[INFO] Génération des arcs étiquetés → {output_edges_file}")
     
     with open(kmer_file) as km_in, open(output_edges_file, "w") as edges_out:
-        for line in km_in:
-            kmer = line.strip()
-            if len(kmer) < 2:
-                continue
-            
-            prefix = kmer[:-1]
-            suffix = kmer[1:]
-            edges_out.write(f"{prefix}\t{suffix}\t{kmer}\n")
+            for line in km_in:
+                kmer = line.strip()
+                if len(kmer) < 2: 
+                    continue
+                
+                prefix = kmer[:-1]
+                suffix = kmer[1:]
+                edges_out.write(f"{prefix}\t{suffix}\t{kmer}\n")
+        
     
-    print("[OK] Arcs étiquetés générés.")
 
-def filter_low_coverage_kmers(kmer_count_file: str, output_filtered: str, min_coverage: int = 2):
+def filter_contigs_by_length(input_file: str, output_file: str, min_length: int):
     """
-    Filtre les k-mers avec une couverture trop faible.
+    Filtre les contigs d'un fichier FASTA/FASTQ en fonction de leur longueur.
+    Génère un nouveau fichier FASTA contenant uniquement les contigs >= min_length.
     """
-    print(f"[INFO] Filtrage des k-mers avec couverture < {min_coverage}")
+    print(f"[INFO] Filtrage des contigs... (longueur minimale: {min_length})")
     
-    with open(kmer_count_file) as f_in, open(output_filtered, "w") as f_out:
-        for line in f_in:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                count = int(parts[0])
-                kmer = parts[1]
-                if count >= min_coverage and all(base in 'ACGT' for base in kmer):
-                    f_out.write(kmer + "\n")
+    try:
+        # Lecture des enregistrements depuis le fichier FASTA
+        records = list(SeqIO.parse(input_file, "fasta"))
+        
+        # Filtrage des enregistrements
+        filtered_records = [
+            record for record in records if len(record.seq) >= min_length
+        ]
+        
+        # Écriture des contigs filtrés dans le nouveau fichier
+        SeqIO.write(filtered_records, output_file, "fasta")
+        
+        print(f"[OK] {len(filtered_records)} contigs conservés sur {len(records)} → {output_file}")
+        return len(filtered_records)
+        
+    except FileNotFoundError:
+        print(f"[ATTENTION] Fichier d'entrée pour le filtrage non trouvé: {input_file}")
+        return 0
+    except Exception as e:
+        print(f"[ERREUR] Échec du filtrage des contigs: {e}")
+        return 0
+
+
+if __name__ == "__main__":
     
-    print("[OK] Filtrage terminé")
+    #  Définition des valeurs par défaut 
+    DEFAULT_PATH = 'reads.fastq.fq'
+    DEFAULT_K = 31
+    DEFAULT_MIN_LEN = 1000 
 
-#######################################
-# SCRIPT PRINCIPAL
-#######################################
-# SCRIPT PRINCIPAL — VERSION CONTIGS COMPLETS
-#######################################
 
-path = "reads.fastq.fq"
-k = 31
+    """G = pgv.AGraph(directed=True, strict=False)  # strict=False pour autoriser multi-arêtes
 
-try:
-    # Étape A — Génération des k-mers (streaming)
-    build_kmer_database_to_file(path, k, "kmers_raw.txt")
+    with open(edges_file) as f:
+        for line in f:
+            prefix, suffix, kmer = line.strip().split("\t")
+            # Ajouter l'arête avec étiquette
+            G.add_edge(prefix, suffix, label=kmer)
 
-    # Étape B — Comptage (sort | uniq -c)
-    count_kmers_with_sort("kmers_raw.txt", "kmers_counted.txt")
+    # Mise en page automatique avec Graphviz (dot, neato, fdp, etc.)
+    G.layout(prog='dot')  # 'dot' pour DAG, 'neato' ou 'fdp' pour plus libre
 
-    # Étape B2 — Filtrage des k-mers à faible couverture
-    filter_low_coverage_kmers("kmers_counted.txt", "kmers_filtered.txt", min_coverage=2)
-
-    # Étape C — Construction des arcs du graphe
-    build_debruijn_edges_to_file_with_labels("kmers_filtered.txt", "edges_labeled.txt")
-
-    # Étape D — Assemblage
-    euler_finder = EulerianPathFinder("edges_labeled.txt", k)
+    # Sauvegarder en PNG ou PDF
+    #G.draw("debruijn_graph.png")
+    G.draw("debruijn_graph.pdf")"""
     
-    # On récupère tous les contigs possibles
-    print("[INFO] Assemblage de tous les contigs...")
-    contigs = []
 
-    # Essayer d'abord un chemin eulérien principal
-    kmer_path = euler_finder.find_longest_greedy_path()
+    # Définiton du format de la ligne de commande par l'utilisateur  
+    parser = argparse.ArgumentParser(
+        description="Assembleur De Bruijn à Chemin Eulérien.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=f"Exemple: python3 projet.py --filename reads.fastq.fq -k 40 --filter 100\n"
+               f"Par défaut: --filename '{DEFAULT_PATH}', -k {DEFAULT_K}, --filter {DEFAULT_MIN_LEN}"
+    )
+    
+    # ARGUMENT MODIFIÉ : -f remplacé par --filename
+    parser.add_argument(
+        '--filename',
+        type=str,
+        default=DEFAULT_PATH,
+        dest='path', # Utilisation de 'dest' pour maintenir le nom de variable 'path'
+        help="Chemin vers le fichier FASTQ d'entrée (reads)"
+    )
+    
+    parser.add_argument(
+        '-k', '--kmer',
+        type=int,
+        default=DEFAULT_K,
+        help="Taille du k-mer (k) pour l'assemblage"
+    )
+    
+    # ARGUMENT MODIFIÉ : -l remplacé par --filter
+    parser.add_argument(
+        '--filter',
+        type=int,
+        default=DEFAULT_MIN_LEN,
+        dest='min_length', # Utilisation de 'dest' pour maintenir le nom de variable 'min_length'
+        help="Longueur minimale des contigs à conserver après l'assemblage"
+    )
 
-    if kmer_path:
-        sequence_reconstructed = euler_finder.reconstruct_sequence(kmer_path)
-        contigs.append(sequence_reconstructed)
-        print(f"[INFO] Chemin eulérien principal: {len(sequence_reconstructed)} bp")
+    args = parser.parse_args()
+    
 
-    # Puis compléter avec toutes les autres composantes
-    contigs_from_components = euler_finder.assemble_contigs()
-    contigs.extend(contigs_from_components)
+    # Récupération des arguments par leurs noms de 'dest'
+    path = args.path
+    k = args.kmer
+    min_length = args.min_length 
+    
 
-    # Écriture finale dans un fichier FASTA
-    with open("assembled_contigs.fasta", "w") as f:
+    print("--- Assembleur De Bruijn à Chemin Eulérien ---")
+    print(f"Fichier d'entrée: {path}")
+    print(f"Taille du k-mer (k): {k}")
+    print(f"Longueur minimale pour le filtrage (--filter): {min_length}")
+
+    # Définition des noms de fichiers intermédiaires et de sortie
+    kmer_raw_file = "kmers_raw.txt"
+    kmer_counted_file = "kmers_counted.txt"
+    edges_labeled_file = "edges_labeled.txt"
+    output_contig_file = "assembled_contigs.fasta"
+    output_contig_filtered_file = "assembled_contigs_filtered.fasta" # Nouveau fichier de sortie filtré
+
+    # --- ÉTAPES D'ASSEMBLAGE ---
+    
+        # Étape A — Génération des k-mers
+    build_kmer_database_to_file(path, k, kmer_raw_file)
+
+        # Étape B — Comptage (facultatif)
+    #count_kmers_with_sort(kmer_raw_file, kmer_counted_file)
+
+        # Étape C — Construction des arcs du graphe de De Bruijn
+    build_debruijn_edges_to_file_with_labels(kmer_raw_file, edges_labeled_file)
+        
+        # Étape D — Recherche du chemin eulérien et reconstruction des contigs
+    euler_finder = EulerianPathFinder(edges_labeled_file, k) 
+    contigs = euler_finder.find_eulerian_path_with_contigs()
+
+        # Étape E — Sauvegarde des contigs (bruts)
+    print(f"[INFO] Sauvegarde des contigs bruts → {output_contig_file}")
+    with open(output_contig_file, "w") as f:
         for i, contig in enumerate(contigs):
-            if len(contig) >= k:  # éviter les contigs trop courts
-                f.write(f">contig_{i+1}_length_{len(contig)}\n")
-                f.write(contig + "\n")
+            f.write(f">contig_{i} Length={len(contig)}\n{contig}\n")
+    print(f"[OK] {len(contigs)} contigs enregistrés.")
 
-    print(f"[SUCCÈS] {len(contigs)} contigs écrits dans assembled_contigs.fasta")
+        # Étape F — Filtrage des contigs
+    filter_contigs_by_length(output_contig_file, output_contig_filtered_file, min_length)
+        
+        # Nettoyage des fichiers intermédiaires
+    print("\n[INFO] Nettoyage des fichiers intermédiaires...")
+    files_to_clean = [kmer_raw_file, kmer_counted_file]
+    for file in files_to_clean:
+        try:
+            if os.path.exists(file):
+                os.remove(file)
+        except OSError as e:
+            print(f"[ATTENTION] Impossible de supprimer {file}: {e}")
 
-except Exception as e:
-    print(f"[ERREUR] {e}")
-    import traceback
-    traceback.print_exc()
+    print(f"\n[TERMINÉ] L'assemblage et le filtrage sont terminés.")
+    print(f"Contigs bruts: '{output_contig_file}'")
+    print(f"Contigs filtrés (>= {min_length} bp): '{output_contig_filtered_file}'")
+    print("-" * 40)
