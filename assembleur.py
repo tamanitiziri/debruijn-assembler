@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+#Ciaran MAHONY 
+#Tiziri TAMANI
 from Bio import SeqIO
 import gzip
 import subprocess
